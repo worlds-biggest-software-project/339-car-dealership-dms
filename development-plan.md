@@ -1,0 +1,788 @@
+# Car Dealership DMS — Phased Development Plan
+
+> Project: 339-car-dealership-dms · Created: 2026-05-30
+> Purpose: Provide sufficient detail for Claude Code (Opus) to implement each phase end-to-end.
+
+This plan synthesises `research.md`, `features.md`, `standards.md`, `README.md`, and the three `data-model-suggestion-*.md` files into a concrete, phased build for an AI-native, open-source Dealer Management System (DMS). The MVP scope is taken from `features.md` ("Must-have"), with should-have/nice-to-have items deferred to later phases.
+
+The chosen data model is **Data Model Suggestion 1 (Entity-Centric Normalized Relational)** because the MVP requires cross-departmental KPI reporting (gross profit by salesperson, F&I penetration, service absorption, days-to-turn) and regulatory auditability — both of which are strongest with full referential integrity. We borrow two ideas from **Data Model Suggestion 3 (Event-Sourced / Audit-First)**: a partitioned, append-only `audit_log` and a separated, independently-queryable compliance surface, giving FTC Safeguards Rule / OFAC audit trails without committing the whole system to CQRS complexity.
+
+---
+
+## Technology Decisions
+
+| Concern | Choice | Rationale |
+|---------|--------|-----------|
+| Primary language | TypeScript (Node.js 22 LTS) | The system is API + web-UI heavy (dashboards, deal desking, service lane), not ML-training heavy. A single language across API, web, and shared domain types eliminates schema drift between client and server. STAR/Fortellis/Tekion/Dealertrack APIs are all REST/JSON, which TypeScript consumes natively. |
+| Monorepo tooling | pnpm workspaces + Turborepo | Multiple deployable units (API, web, worker, MCP server) share domain types, DB client, and validation schemas. Turborepo gives cached, parallel builds. |
+| API framework | NestJS 11 | Module-per-domain (sales, F&I, service, parts, accounting, compliance) maps cleanly to the dealership departmental structure. First-class dependency injection, guards (RBAC/MFA), interceptors (audit logging), and built-in OpenAPI 3.1 generation — required for STAR/partner interoperability. |
+| Database | PostgreSQL 16 | Data Model 1 relies on UUIDs, `CHECK` constraints, `JSONB` (AI pricing, FTC disclosures), `GIN` indexes, table partitioning (audit_log), `SERIAL` deal/RO numbers, and `INET`. All native to Postgres. |
+| ORM / migrations | Drizzle ORM + drizzle-kit | Type-safe SQL-first schema mirrors the hand-written DDL in the data model docs almost verbatim, supports raw SQL for partitioned tables and `GIN` indexes, and generates TS types consumed by the whole monorepo. |
+| Task queue | BullMQ (Redis-backed) | Async workloads: lender submissions, OFAC screening, NHTSA decode/recall lookups, LLM calls, QuickBooks/Stripe webhook fan-out, AI repricing. Redis also serves as the rate-limit and session store. |
+| Cache / sessions | Redis 7 | BullMQ backing store, OFAC SDN list cache, NHTSA decode cache, API rate limiting. |
+| LLM / AI access | Vercel AI SDK v5 + provider routing (Anthropic Claude primary) | Used for lead scoring, F&I recommendations, AI pricing rationale, churn risk, and the conversational assistant. AI SDK gives structured output (Zod-validated tool calls) and provider failover. |
+| Auth | OAuth 2.0 (RFC 6749) + JWT (RFC 7519), TOTP MFA | Staff log in via authorization-code flow; partner integrations use client-credentials. FTC Safeguards Rule mandates MFA for all DMS access — enforced by a NestJS guard. |
+| Frontend | Next.js 15 (App Router) + React 19 + Tailwind + shadcn/ui | Server components for fast dashboard loads; role-based dealership console (deal desking, F&I menu, service lane, inventory, dashboards). |
+| Validation | Zod | Single source of runtime validation shared between API DTOs, queue payloads, LLM tool schemas, and STAR JSON Schema (Draft 2020-12) checks. |
+| AI agent surface | MCP server (`@modelcontextprotocol/sdk`) | Exposes inventory/customer/deal as MCP resources and tools per `standards.md` §MCP, enabling agentic workflows without bespoke clients. |
+| External vehicle data | NHTSA vPIC + Recalls APIs | Free, no-auth VIN decode, recalls, and safety ratings — baseline inventory enrichment. |
+| Payments | Stripe | Tokenised payments only (PCI DSS v4.0 — no card data stored); `payments.stripe_payment_intent_id`. |
+| Accounting | QuickBooks Online API | `qbo_*` reference columns already present in the data model. |
+| Containerisation | Docker + docker-compose | Self-hostable per README; compose brings up Postgres, Redis, API, worker, web for dev and small single-rooftop deployments. |
+| Testing | Vitest (unit/integration) + Supertest (HTTP) + Playwright (E2E) + Testcontainers (real Postgres/Redis) | Vitest is fast and ESM-native; Testcontainers gives real DB integration tests in CI. |
+| Code quality | ESLint (typescript-eslint) + Prettier + `tsc --noEmit` | Standard TS toolchain; enforced in CI and Definition of Done. |
+| API spec | OpenAPI 3.1.1 (auto-generated by NestJS) | Required by `standards.md`; published for partner/STAR interoperability. |
+| Object storage | S3-compatible (MinIO in dev, AWS S3 in prod) | Vehicle photos, signed documents, generated FTC Buyers Guides / disclosure PDFs. |
+
+### Project Structure
+
+```
+car-dealership-dms/
+├── package.json                 # pnpm workspace root
+├── pnpm-workspace.yaml
+├── turbo.json
+├── docker-compose.yml           # postgres, redis, minio, api, worker, web
+├── Dockerfile.api
+├── Dockerfile.worker
+├── Dockerfile.web
+├── .env.example
+├── packages/
+│   ├── domain/                  # framework-agnostic domain types, money helpers, VIN utils, enums
+│   │   └── src/
+│   │       ├── money.ts         # cents <-> display, never floats
+│   │       ├── vin.ts           # ISO 3779 validation/decode helpers
+│   │       ├── enums.ts         # deal_status, ro_status, roles, etc.
+│   │       └── gross.ts         # front/back/total gross calculators
+│   ├── db/                      # Drizzle schema + migrations + client
+│   │   └── src/
+│   │       ├── schema/          # one file per table group (mirrors Data Model 1)
+│   │       ├── migrations/
+│   │       └── client.ts
+│   ├── contracts/               # Zod schemas + generated OpenAPI DTOs shared API<->web
+│   │   └── src/
+│   │       ├── deals.ts
+│   │       ├── inventory.ts
+│   │       └── star/            # STAR-aligned JSON Schemas (Draft 2020-12)
+│   └── ai/                      # LLM prompt templates, structured-output schemas, providers
+│       └── src/
+│           ├── lead-scoring.ts
+│           ├── fi-recommend.ts
+│           └── pricing.ts
+├── apps/
+│   ├── api/                     # NestJS REST API
+│   │   └── src/
+│   │       ├── main.ts
+│   │       ├── app.module.ts
+│   │       ├── common/          # guards (auth, mfa, rbac), interceptors (audit), filters
+│   │       ├── auth/
+│   │       ├── dealerships/
+│   │       ├── staff/
+│   │       ├── customers/
+│   │       ├── inventory/       # vehicles
+│   │       ├── leads/
+│   │       ├── deals/           # deals, deal_fi_products
+│   │       ├── fi/              # fi_products, lender_submissions
+│   │       ├── service/         # repair_orders, service_line_items, appointments
+│   │       ├── parts/
+│   │       ├── accounting/      # gl_accounts, journal_entries, payments
+│   │       ├── compliance/      # screenings, cash_reports, titling
+│   │       ├── reporting/       # KPI dashboards
+│   │       └── integrations/    # nhtsa, stripe, quickbooks, routeone clients
+│   ├── worker/                  # BullMQ processors (screening, decode, llm, webhooks)
+│   │   └── src/
+│   │       ├── queues.ts
+│   │       └── processors/
+│   ├── web/                     # Next.js dealership console
+│   │   └── src/app/
+│   └── mcp/                     # MCP server exposing DMS tools/resources
+│       └── src/
+└── tests/
+    ├── e2e/                     # Playwright
+    └── fixtures/                # sample VINs, SDN list slice, STAR payloads, deal jackets
+```
+
+---
+
+## Phase 1: Foundation — Monorepo, Database, Auth & Audit Core
+
+### Purpose
+Establish the monorepo, the full normalized schema (Data Model 1), and the cross-cutting security primitives that every later phase depends on: OAuth 2.0 + JWT auth, TOTP MFA enforcement, role-based access control, and an append-only audit log. After this phase the API boots, connects to Postgres/Redis, a user can authenticate with MFA, and every mutating request is recorded to `audit_log`. Nothing dealership-specific works yet, but the spine that satisfies the FTC Safeguards Rule exists.
+
+### Tasks
+
+#### 1.1 — Monorepo & toolchain bootstrap
+**What**: Initialise the pnpm/Turborepo workspace with the `packages/` and `apps/` layout, shared tsconfig, ESLint, Prettier, Vitest, and a working `docker-compose.yml`.
+
+**Design**:
+- `pnpm-workspace.yaml` includes `packages/*` and `apps/*`.
+- `turbo.json` pipelines: `build`, `lint`, `typecheck`, `test`, with `^build` dependency ordering.
+- `docker-compose.yml` services: `postgres:16`, `redis:7`, `minio`, `api`, `worker`, `web`. Healthchecks on postgres/redis; api/worker `depends_on` healthy db.
+- `.env.example` keys: `DATABASE_URL`, `REDIS_URL`, `JWT_SECRET`, `JWT_ISSUER`, `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `ANTHROPIC_API_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `QBO_CLIENT_ID`, `QBO_CLIENT_SECRET`, `NHTSA_BASE_URL`.
+- `packages/domain/src/money.ts`:
+```ts
+export type Cents = number & { readonly __brand: 'Cents' };
+export const cents = (n: number): Cents => Math.round(n) as Cents;
+export const fromDollars = (d: number): Cents => cents(d * 100);
+export const toDisplay = (c: Cents): string =>
+  (c / 100).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
+```
+
+**Testing**:
+- `Unit: fromDollars(199.95) → 19995`
+- `Unit: toDisplay(19995 as Cents) → "$199.95"`
+- `Unit: cents(10.4) → 10, cents(10.6) → 11` (rounding)
+- `Integration: docker compose up → api container reports /health 200 once postgres healthy`
+- `CI: pnpm lint && pnpm typecheck && pnpm test all pass on empty workspace`
+
+#### 1.2 — Database schema & migrations (Data Model 1)
+**What**: Implement the complete 22-table normalized schema from `data-model-suggestion-1.md` as Drizzle schema files plus an initial migration, including all CHECK constraints, indexes, GIN indexes, and the partitioned `audit_log`.
+
+**Design**:
+- One schema file per group: `dealership.ts` (dealerships, staff), `customer-vehicle.ts` (customers, vehicles), `deals.ts` (deals, fi_products, deal_fi_products, lender_submissions), `compliance.ts` (compliance_screenings, cash_reports, titling_registrations), `service.ts` (repair_orders, service_line_items, parts), `crm.ts` (leads, appointments), `accounting.ts` (payments, gl_accounts, journal_entries, journal_lines), `audit.ts` (integrations, audit_log).
+- All monetary columns `BIGINT` cents. All ids `UUID DEFAULT gen_random_uuid()`. VIN `CHAR(17) CHECK (vin ~ '^[A-HJ-NPR-Z0-9]{17}$')`.
+- `audit_log` created via raw SQL migration with `PARTITION BY RANGE (created_at)` and a monthly partition-creation helper function `ensure_audit_partition(month date)`.
+- A seed script (`packages/db/src/seed.ts`) inserts one demo dealership, a standard GL chart of accounts, and one staff member per role.
+
+**Testing**:
+- `Integration (Testcontainers Postgres): run all migrations → 22 tables + audit partitions exist`
+- `Integration: insert vehicle with 16-char VIN → CHECK constraint violation`
+- `Integration: insert deal referencing non-existent customer_id → FK violation`
+- `Integration: insert journal_lines with debit and credit both zero is allowed; query SUM(debit)=SUM(credit) helper returns balanced`
+- `Integration: seed script runs idempotently (second run no duplicate dealership by slug)`
+- `Unit: ensure_audit_partition('2026-06-01') creates audit_log_2026_06`
+
+#### 1.3 — Auth: OAuth 2.0 authorization-code + client-credentials, JWT issuance
+**What**: NestJS `auth` module issuing JWTs (RFC 7519) via OAuth 2.0 authorization-code flow for staff and client-credentials for partner integrations.
+
+**Design**:
+- Endpoints: `POST /auth/login` (email+password → returns `mfa_required` + temporary challenge token), `POST /auth/mfa/verify` (TOTP code → access+refresh JWT), `POST /auth/token` (client_credentials grant → scoped JWT), `POST /auth/refresh`.
+- JWT claims: `sub` (staff id), `dealership_id`, `role`, `mfa` (boolean), `scope[]`, `iss`, `exp` (15 min access, 7 day refresh).
+- Passwords hashed with argon2id. TOTP via `otplib`, secret stored encrypted on `staff` (add `mfa_secret_enc`, `mfa_enabled` already exists).
+- `JwtAuthGuard` validates signature/expiry; attaches `AuthContext { staffId, dealershipId, role, mfa, scopes }` to request.
+
+**Testing**:
+- `Integration (mocked db): valid credentials → 200 with mfa_required=true, no access token yet`
+- `Integration: correct TOTP after login challenge → access + refresh JWT issued, mfa claim true`
+- `Integration: wrong TOTP → 401, no token`
+- `Integration: client_credentials with valid client → scoped JWT, mfa claim absent`
+- `Unit: expired JWT → guard throws 401`
+- `Unit: argon2id verify rejects tampered hash`
+
+#### 1.4 — RBAC + MFA guards and the audit interceptor
+**What**: Guards enforcing role permissions and MFA, plus a global interceptor that writes an `audit_log` row for every mutating request.
+
+**Design**:
+- `@Roles('sales_manager','dealer_principal')` decorator + `RolesGuard` checks `AuthContext.role` against the route's allowed roles (roles enumerated in `packages/domain/src/enums.ts`).
+- `MfaGuard` rejects (403 `MFA_REQUIRED`) any request whose JWT lacks `mfa: true` on routes touching customer NPI (customers, deals, lender_submissions, compliance, payments).
+- `AuditInterceptor` runs on POST/PATCH/PUT/DELETE: after success, inserts `audit_log { dealership_id, actor_id, actor_type:'staff', action: '<METHOD> <route>', entity_type, entity_id, changes_json, ip_address, user_agent, mfa_verified }`. For AI-initiated actions actor_type is `'ai'`.
+- Tenancy: a `TenancyInterceptor` injects `dealership_id` from `AuthContext` and a repository base class scopes all queries by it.
+
+**Testing**:
+- `Integration: salesperson hits manager-only route → 403`
+- `Integration: JWT without mfa hits POST /deals → 403 MFA_REQUIRED`
+- `Integration: successful POST /customers → audit_log row with action, entity_type='customer', entity_id, mfa_verified=true`
+- `Integration: GET requests produce no audit_log rows`
+- `Integration: staff from dealership A cannot read dealership B customer (404, not 403, to avoid enumeration)`
+
+---
+
+## Phase 2: Inventory & Vehicle Data Core
+
+### Purpose
+Build the vehicle inventory module — the cross-departmental anchor that sales, service, and compliance all reference. Includes VIN validation (ISO 3779), NHTSA vPIC decode enrichment, recall checks, and pricing fields. After this phase a dealer can add a vehicle by VIN, have it auto-decoded, see recalls, and manage stock status.
+
+### Tasks
+
+#### 2.1 — Vehicle CRUD with ISO 3779 VIN validation
+**What**: `inventory` module exposing CRUD over `vehicles` with VIN check-digit validation and status lifecycle.
+
+**Design**:
+- `packages/domain/src/vin.ts`: `isValidVin(vin)` (17 chars, no I/O/Q, ISO 3779 check-digit at position 9), `wmi(vin)`, `vds(vin)`, `vis(vin)`.
+- Endpoints: `POST /inventory/vehicles`, `GET /inventory/vehicles?status=&condition=&make=&model=&q=`, `GET /inventory/vehicles/:id`, `PATCH /inventory/vehicles/:id`, `POST /inventory/vehicles/:id/status` (transition).
+- Status transitions enforced in a `VehicleStatusMachine`: `in_transit → in_stock → on_lot → {sold|wholesale}`; `pending_recon` reachable from `in_stock`. Illegal transitions → 409.
+- `days_in_stock` computed from `acquisition_date`.
+- DTOs are Zod schemas in `packages/contracts/src/inventory.ts`.
+
+**Testing**:
+- `Unit: isValidVin('1HGCM82633A004352') → true; check digit failure → false; lowercase i present → false`
+- `Integration: POST vehicle with valid VIN → 201, days_in_stock computed`
+- `Integration: duplicate (dealership_id, vin) → 409`
+- `Integration: status sold → in_stock transition → 409 illegal transition`
+- `Integration: list filtered by status=in_stock&condition=used returns only matching rows`
+
+#### 2.2 — NHTSA vPIC decode + recall enrichment (worker)
+**What**: A BullMQ job that, on vehicle creation, calls NHTSA vPIC to decode the VIN and the Recalls API to fetch open campaigns, writing results to `vehicles.nhtsa_decoded_json`.
+
+**Design**:
+- `integrations/nhtsa` client: `decodeVin(vin): NhtsaDecode` → `GET {NHTSA_BASE_URL}/vehicles/DecodeVinValues/{vin}?format=json`; `recalls(make,model,year)` → `GET https://api.nhtsa.gov/recalls/...`. Responses cached in Redis 30 days keyed by VIN.
+- On `vehicle.created` event, enqueue `decode-vehicle` job. Processor decodes, merges make/model/year/body_style/engine into the vehicle if blank, stores raw decode in `nhtsa_decoded_json`, runs recall lookup, and appends to a `recall_checks` structure.
+- Retry policy: 3 attempts, exponential backoff; on permanent failure mark `nhtsa_decoded_json.error`.
+
+**Testing**:
+- `Integration (mocked NHTSA): decode job for known VIN → make/model/year populated`
+- `Integration (mocked NHTSA): recall lookup returns 2 campaigns → stored, recall_status='open'`
+- `Integration: second decode of same VIN within 30 days → served from Redis cache (NHTSA not called)`
+- `Integration: NHTSA 500 thrice → job fails, nhtsa_decoded_json.error set, vehicle still usable`
+
+#### 2.3 — Vehicle photos & object storage
+**What**: Upload vehicle photos to S3-compatible storage and store URLs on `vehicles.photo_urls`.
+
+**Design**:
+- `POST /inventory/vehicles/:id/photos` (multipart) → stores to `s3://{bucket}/vehicles/{id}/{uuid}.jpg`, returns signed/public URL appended to `photo_urls`.
+- `DELETE /inventory/vehicles/:id/photos` with url body → removes from array and storage.
+- Max 30 photos/vehicle; only image/jpeg|png; 10 MB cap.
+
+**Testing**:
+- `Integration (MinIO Testcontainer): upload jpeg → object exists, url in photo_urls`
+- `Integration: upload 31st photo → 422`
+- `Integration: upload application/pdf → 415`
+- `Integration: delete url → removed from array and bucket`
+
+---
+
+## Phase 3: Customers, Leads & CRM
+
+### Purpose
+Establish customer records and the lead pipeline — the entry point of every sale and the home of communication history. After this phase leads can be captured, assigned, and progressed to customers, and customers carry contact and communication context used by deals, service, and compliance.
+
+### Tasks
+
+#### 3.1 — Customer CRUD with NPI access controls
+**What**: `customers` module with CRUD and GLBA-aware access (MFA-gated, audited).
+
+**Design**:
+- Endpoints: `POST/GET/PATCH /customers`, `GET /customers?q=&phone=&email=`, `GET /customers/:id`.
+- `is_business` toggles `business_name`/`tax_id` requirements (Zod refinement).
+- Search uses the `idx_customers_phone`/`idx_customers_email` indexes; `q` does case-insensitive name match.
+- All reads of `drivers_licence_number`, `date_of_birth`, `tax_id` produce a `data_access_logged`-style audit entry (GLBA NPI access).
+
+**Testing**:
+- `Integration: create individual customer without business_name → 201`
+- `Integration: is_business=true without business_name → 422`
+- `Integration: GET /customers/:id returning DL number → audit_log NPI access row written`
+- `Integration: search by partial phone → matching customers`
+
+#### 3.2 — Lead capture, AI lead scoring, and assignment
+**What**: `leads` module supporting capture from multiple sources, AI scoring, and assignment to best-matched salesperson.
+
+**Design**:
+- Endpoints: `POST /leads` (also accepts unauthenticated webhook form posts from website via signed token), `GET /leads?status=&assigned_to=`, `PATCH /leads/:id` (status transitions per the `leads.status` enum), `POST /leads/:id/assign`.
+- On lead creation, enqueue `score-lead` job. The AI scoring prompt (in `packages/ai/src/lead-scoring.ts`) returns structured output validated by Zod:
+```ts
+const LeadScore = z.object({
+  score: z.number().int().min(0).max(100),
+  next_action: z.enum(['call_now','text','email','schedule_appointment','nurture']),
+  rationale: z.string().max(400),
+  factors: z.array(z.string()).max(6),
+});
+```
+- System prompt template summarises lead source, vehicle interest, customer history (prior deals/service), and response timing; instructs the model to weigh purchase intent and historical conversion. Result written to `leads.ai_score`, `leads.ai_next_action`; an `ai`-actor audit row recorded.
+- First-response SLA: `first_response_at` set on first `lead_contacted` PATCH.
+
+**Testing**:
+- `Integration (mocked LLM): new web lead → score-lead job runs → ai_score in [0,100], ai_next_action set`
+- `Integration: LLM returns score 142 → Zod rejects → job retried, lead left unscored after exhaustion (no crash)`
+- `Integration: lead status new → sold direct transition → 409 (must pass through pipeline)`
+- `Integration: signed website webhook with bad signature → 401, no lead created`
+- `Unit: lead-scoring prompt builder includes vehicle interest and prior deal count`
+
+#### 3.3 — Communication log & appointments
+**What**: Record customer communications and book sales/service/F&I appointments.
+
+**Design**:
+- `appointments` CRUD over the `appointments` table; conflict check prevents double-booking the same `staff_id` overlapping `scheduled_start/end` (409).
+- Communication entries stored as `audit_log`-adjacent records or a lightweight `communications` JSONB on customer (per Model 2's pattern) — for Model 1 we add minimal: outbound message send enqueues a `notify` job (email via SendGrid / SMS via Twilio) and records the send.
+- `POST /appointments`, `GET /appointments?department=&date=`, `PATCH /appointments/:id` (status: scheduled→confirmed→checked_in→completed | no_show | cancelled). Reminder job sends 24h before and stamps `reminder_sent_at`.
+
+**Testing**:
+- `Integration: book overlapping appointment for same advisor → 409`
+- `Integration: appointment 24h out → reminder job sends, reminder_sent_at set`
+- `Integration (mocked Twilio): outbound SMS → provider called once, send recorded`
+- `Integration: no_show transition allowed only from scheduled/confirmed`
+
+---
+
+## Phase 4: Deals & Desking (Core Value Proposition)
+
+### Purpose
+The heart of the DMS: structuring a vehicle sale. This phase implements the deal lifecycle, deal-level pricing math (front/back/total gross), trade-ins, and the deal state machine. After this phase a salesperson can create a deal, desk it (price it), attach a trade, and advance it through the pipeline — the single most important DMS workflow.
+
+### Tasks
+
+#### 4.1 — Deal creation & lifecycle state machine
+**What**: `deals` module with deal creation linking customer + vehicle + staff and a strict status machine.
+
+**Design**:
+- Status machine: `pending → desking → fi_review → contract_signed → funded → delivered`; side-exits `unwound` (from funded/delivered) and `cancelled` (from pending/desking/fi_review). Each transition validated; illegal → 409. Transition also enforces preconditions (e.g., cannot reach `contract_signed` without a cleared OFAC screening — wired in Phase 6).
+- `deal_number` is `SERIAL` per the schema.
+- Creating a deal sets vehicle status to a soft-held state (does not mark `sold` until delivery).
+- DTOs in `packages/contracts/src/deals.ts`.
+
+**Testing**:
+- `Integration: create deal → 201, deal_number assigned, vehicle reachable`
+- `Integration: pending → funded direct jump → 409`
+- `Integration: cancel from desking → 200, vehicle released`
+- `Integration: two concurrent deals on same vehicle → second blocked (vehicle already held)`
+
+#### 4.2 — Desking math: pricing, taxes, fees, gross
+**What**: Pure, tested deal-math engine producing all monetary fields on `deals`.
+
+**Design**:
+- `packages/domain/src/gross.ts`:
+```ts
+interface DeskingInput {
+  sellingPrice: Cents; tradeAllowance: Cents; tradePayoff: Cents;
+  docFee: Cents; salesTaxRateBps: number; feeItems: Cents[];
+  fiProductsRetail: Cents[]; fiProductsCost: Cents[];
+  vehicleCost: Cents; downPayment: Cents; aprBps?: number; termMonths?: number;
+}
+interface DeskingResult {
+  totalTaxes: Cents; totalFees: Cents; totalFi: Cents; totalDeal: Cents;
+  frontGross: Cents; backGross: Cents; totalGross: Cents;
+  amountFinanced: Cents; monthlyPayment?: Cents;
+}
+export function computeDesking(i: DeskingInput): DeskingResult;
+```
+- Front gross = sellingPrice − vehicleCost − (tradeAllowance − tradeACV adjustment). Back gross = Σ(fiProductRetail − fiProductCost). Taxes = (sellingPrice − tradeAllowance + fees) × rate (state-trade-credit aware; configurable). Monthly payment via standard amortisation when apr/term present.
+- `POST /deals/:id/desk` accepts `DeskingInput`, writes computed fields, returns `DeskingResult`. Money never floats — all cents integer math.
+
+**Testing**:
+- `Unit: known deal (sell 28500.00, cost 24000.00, trade 12000.00, payoff 8000.00, doc 499, tax 8.25%) → exact front/back/total gross`
+- `Unit: monthlyPayment for 27079.00 @ 5.49% / 72mo → expected cents`
+- `Unit: zero apr → monthlyPayment = amountFinanced / term`
+- `Unit: negative front gross (sell below cost) allowed and reported`
+- `Integration: POST /deals/:id/desk → deal status moves to desking, fields persisted`
+
+#### 4.3 — Trade-in handling
+**What**: Attach a trade-in vehicle to a deal with allowance, payoff, and ACV.
+
+**Design**:
+- A trade-in creates/links a `vehicles` row (acquisition_source `trade_in`) and sets `deals.trade_vehicle_id`, `trade_allowance_cents`, `trade_payoff_cents`.
+- Negative equity (payoff > allowance) rolls into amount financed; surfaced in `DeskingResult`.
+- Trade VIN decoded via the Phase 2 NHTSA job.
+
+**Testing**:
+- `Integration: attach trade → new vehicle row with source=trade_in, deal.trade_vehicle_id set`
+- `Unit: negative equity (payoff 10000 > allowance 8000) → 2000 added to amount financed`
+- `Integration: trade VIN triggers decode job`
+
+---
+
+## Phase 5: F&I — Products, Menus & Lender Submissions
+
+### Purpose
+Finance & Insurance: the dealership's highest-margin function. Implements the F&I product catalogue, per-deal product sales (back gross), AI product recommendations, and lender credit-application submission/decisioning. After this phase a deal can move through F&I review with products presented, sold, and financing arranged.
+
+### Tasks
+
+#### 5.1 — F&I product catalogue & deal product attachment
+**What**: CRUD over `fi_products` and attachment to deals via `deal_fi_products`.
+
+**Design**:
+- `POST/GET/PATCH /fi/products`; `POST /deals/:id/fi-products` (attach), `DELETE /deals/:id/fi-products/:lineId`.
+- Attaching a product recomputes `deals.total_fi_cents` and `back_gross_cents` via the desking engine. `max_markup_cents` enforced (422 if selling − cost exceeds cap).
+- `term_months`, `deductible_cents`, `mileage_limit` snapshotted onto `deal_fi_products`.
+
+**Testing**:
+- `Integration: attach extended warranty → back gross increases by retail−cost`
+- `Integration: selling price above max_markup → 422`
+- `Integration: remove product → back gross recalculated downward`
+
+#### 5.2 — AI F&I product recommendation engine
+**What**: An AI endpoint recommending the optimal F&I product mix for a deal.
+
+**Design**:
+- `POST /deals/:id/fi-recommend` enqueues an LLM call. Prompt (`packages/ai/src/fi-recommend.ts`) inputs: vehicle type/age/mileage, deal financials, customer profile (no protected-class attributes — Fair Credit / ECOA compliant), available catalogue. Structured output:
+```ts
+const FiRecommendation = z.object({
+  recommendations: z.array(z.object({
+    fi_product_id: z.string().uuid(),
+    confidence: z.number().min(0).max(1),
+    rationale: z.string().max(300),
+  })).max(5),
+});
+```
+- Recommendations stored; when a recommended product is later attached, `deal_fi_products.ai_recommended=true`, enabling acceptance-rate tracking.
+- Compliance guard: prompt explicitly excludes race, religion, national origin, sex, marital status, age (ECOA / CFPB Fair Credit).
+
+**Testing**:
+- `Integration (mocked LLM): recommend for used high-mileage vehicle → suggests extended_warranty with confidence`
+- `Unit: prompt builder asserts no protected-class fields present in payload`
+- `Integration: attach a recommended product → ai_recommended flag true`
+
+#### 5.3 — Lender submission & decisioning
+**What**: Submit credit applications to lenders (RouteOne/Dealertrack abstraction) and track the financing lifecycle.
+
+**Design**:
+- `lender_submissions` lifecycle: `submitted → conditionally_approved → approved → funded` (or `declined`/`cancelled`).
+- `POST /deals/:id/lenders` enqueues a `lender-submit` job calling the RouteOne client (`integrations/routeone`, mocked behind an interface in MVP). On decision webhook, update status, `apr_bps`, `term_months`, `monthly_payment_cents`, `conditions[]`, store `routeone_ref`.
+- Selecting an approved lender writes `deals.lender_id`, `apr_bps`, `term_months`, `monthly_payment_cents` and triggers desking recompute.
+- Deal cannot advance to `contract_signed` without a selected approved lender (for non-cash deals).
+
+**Testing**:
+- `Integration (mocked RouteOne): submit credit app → lender_submission status=submitted, ref stored`
+- `Integration: approval webhook → status=approved, apr/term/payment populated`
+- `Integration: decline webhook → status=declined`
+- `Integration: advance deal to contract_signed with no approved lender (financed deal) → 409`
+- `Integration: cash deal advances without lender → allowed`
+
+---
+
+## Phase 6: Compliance & Regulatory Automation
+
+### Purpose
+The strongest differentiator per `features.md`: automated, integrated compliance. Implements OFAC SDN screening (10-year retention), IRS Form 8300 cash-transaction flagging, FTC Buyers Guide / ECOA disclosure generation, and Safeguards Rule audit reporting. After this phase deals are blocked from completing until compliance gates pass, and auditors can query a complete regulatory trail.
+
+### Tasks
+
+#### 6.1 — OFAC SDN list screening
+**What**: Screen customers against the OFAC SDN list before deal completion, with 10-year retention.
+
+**Design**:
+- A daily `refresh-sdn` job downloads the OFAC SDN list (CSV/XML from treasury.gov), normalises names, and caches in Redis + a `sdn_entries` lookup (added small table) with `sdn_list_date`.
+- `POST /compliance/screen` (auto-invoked when a deal enters `fi_review`) fuzzy-matches `screened_name` (Jaro-Winkler ≥ threshold) and writes `compliance_screenings { result: clear|potential_match|confirmed_match, match_details, sdn_list_date, expires_at = now + 10 years }`.
+- A `potential_match` blocks deal progression and raises a compliance alert requiring manual `confirmed_match`/`clear` resolution by a manager.
+
+**Testing**:
+- `Integration: screen name not on list → result=clear, customer.ofac_cleared=true`
+- `Integration: screen exact SDN name → confirmed_match, deal blocked from contract_signed`
+- `Integration: near-match above threshold → potential_match, manager resolution required`
+- `Integration: screening row expires_at = screened_at + 10y`
+- `Unit: Jaro-Winkler('John Smith','Jon Smith') above threshold`
+
+#### 6.2 — IRS Form 8300 cash flagging
+**What**: Detect cash payments over USD 10,000 and create `cash_reports` with a 15-day filing deadline.
+
+**Design**:
+- When cumulative cash (`payments.method='cash'`) on a deal exceeds 1,000,000 cents, create `cash_reports { cash_amount_cents, filing_deadline = paid_at + 15 days, form_8300_filed=false }` and raise an alert.
+- Aggregation considers related cash payments within a 12-month window (IRS related-transactions rule).
+- `POST /compliance/cash-reports/:id/file` records `irs_confirmation`, `filed_at`, sets `form_8300_filed=true`.
+- Dashboard query: unfiled reports with deadline within 5 days.
+
+**Testing**:
+- `Integration: cash payment of 1,050,000 cents → cash_report created, deadline = +15 days`
+- `Integration: two cash payments 600,000 + 600,000 within window → single aggregated report over threshold`
+- `Integration: 950,000 cents cash → no report`
+- `Integration: file report → form_8300_filed=true, confirmation stored`
+
+#### 6.3 — FTC Buyers Guide & ECOA disclosure generation
+**What**: Generate required sale disclosures and store signed status on the deal.
+
+**Design**:
+- `POST /deals/:id/disclosures/buyers-guide` generates an FTC Buyers Guide PDF (`as_is` / `limited_warranty` / `full_warranty` per `deals.buyers_guide_type`) to S3 and records in `deals.ftc_disclosures_json`.
+- ECOA / Equal Credit Opportunity, privacy notice (GLBA), and risk-based-pricing notices tracked as boolean+timestamp keys in `ftc_disclosures_json`.
+- Deal cannot reach `contract_signed` until required disclosures for its deal_type are present.
+
+**Testing**:
+- `Integration: generate as_is buyers guide → PDF in S3, ftc_disclosures_json.buyers_guide set`
+- `Integration: advance to contract_signed without privacy notice on financed deal → 409`
+- `Unit: required-disclosure set differs for cash vs financed deal`
+
+#### 6.4 — Safeguards Rule audit report
+**What**: Generate an FTC Safeguards Rule audit report from `audit_log`.
+
+**Design**:
+- `GET /compliance/safeguards-report?from=&to=` aggregates: MFA coverage (staff with/without MFA), NPI access events, failed-auth counts, and lists access without `mfa_verified`. Output as JSON + downloadable PDF.
+
+**Testing**:
+- `Integration: report counts staff_with_mfa vs without correctly`
+- `Integration: NPI access events in range counted; out-of-range excluded`
+
+---
+
+## Phase 7: Service & Parts
+
+### Purpose
+Fixed operations: repair orders, technician assignment, labour/parts line items, and parts inventory with reorder points. After this phase the service lane can open an RO, add labour and parts, track technician time, invoice, and the parts department can manage stock and reorders.
+
+### Tasks
+
+#### 7.1 — Repair orders & service line items
+**What**: `service` module: open ROs, add labour/part/sublet/fee/discount lines, assign technicians, compute totals.
+
+**Design**:
+- `repair_orders` lifecycle: `open → in_progress → {waiting_parts|waiting_approval} → ready → invoiced → paid → closed`; `void` from non-paid states.
+- `POST /service/ros`, `POST /service/ros/:id/lines`, `PATCH /service/ros/:id/lines/:lineId` (approve, assign technician, record `hours_actual`), `POST /service/ros/:id/invoice`.
+- Totals: line `total_cents = quantity × unit_price` (labour uses `hours_estimated × labour_rate_cents`); RO subtotal/tax/total recomputed on line change; warranty/internal lines flagged non-customer-pay.
+- Parts lines decrement `parts.qty_on_hand` and increment `qty_reserved` until installed.
+
+**Testing**:
+- `Integration: open RO → status open, ro_number assigned`
+- `Integration: add labour line 1.5h @ $150 → total 22500 cents, RO subtotal updated`
+- `Integration: add part line → parts.qty_reserved increments`
+- `Integration: invoice RO → status invoiced, tax computed, qbo flagged for sync`
+- `Integration: warranty line excluded from customer-pay subtotal`
+
+#### 7.2 — Parts inventory & automated reorder
+**What**: `parts` module with stock tracking and reorder-point automation.
+
+**Design**:
+- `POST/GET/PATCH /parts`; stock adjustments via `POST /parts/:id/adjust` (receipt, sale, return).
+- A `check-reorder` scheduled job flags parts where `qty_on_hand − qty_reserved ≤ reorder_point` and raises a reorder suggestion of `reorder_qty`.
+- Unique `(dealership_id, part_number)`.
+
+**Testing**:
+- `Integration: adjust stock below reorder point → reorder suggestion raised for reorder_qty`
+- `Integration: duplicate part_number in dealership → 409`
+- `Integration: reserve then install part → qty_on_hand decremented, qty_reserved cleared`
+
+---
+
+## Phase 8: Accounting & Payments
+
+### Purpose
+The financial backbone: payments (Stripe, tokenised), double-entry general ledger, and automatic journal entries from deals and ROs. After this phase every deal and RO produces balanced GL entries, payments reconcile, and departmental P&L can be computed.
+
+### Tasks
+
+#### 8.1 — Payments (Stripe, tokenised)
+**What**: Record and process payments against deals and ROs without storing card data.
+
+**Design**:
+- `POST /payments` creates a Stripe PaymentIntent for card/ach, stores `stripe_payment_intent_id`; cash/cheque/wire recorded directly. Stripe webhook (`payment-webhook` queue) updates status `pending→succeeded|failed`, stamps `paid_at`.
+- CHECK enforces `deal_id IS NOT NULL OR repair_order_id IS NOT NULL`. Cash payments feed the IRS 8300 check (Phase 6.2).
+- Refunds via `POST /payments/:id/refund` (partial/full), updates `refund_cents`.
+
+**Testing**:
+- `Integration (mocked Stripe): card payment → PaymentIntent created, status pending`
+- `Integration: succeeded webhook → status succeeded, paid_at set`
+- `Integration: cash payment over 10k → triggers cash_report (cross-module)`
+- `Integration: payment with neither deal nor RO → 422`
+
+#### 8.2 — General ledger & automatic journal entries
+**What**: Double-entry GL with auto-posting from deals and ROs.
+
+**Design**:
+- `gl_accounts` chart seeded in Phase 1; `journal_entries` + `journal_lines` with department tagging.
+- A `Posting` service generates balanced entries: on deal `funded` → debit cash/AR, credit vehicle sales + F&I income + cost of sales; on RO `invoiced` → debit AR, credit labour/parts revenue + cost. Every entry asserts `Σ debit = Σ credit` (422/throw if unbalanced).
+- `GET /accounting/journal?from=&to=&department=`; `POST /accounting/journal` (manual adjustment, must balance).
+
+**Testing**:
+- `Unit: deal-funded posting produces balanced entry (Σdebit=Σcredit)`
+- `Integration: unbalanced manual entry → 422`
+- `Integration: RO invoiced → journal entry with service department lines`
+- `Integration: query journal by department=service → only service-tagged lines`
+
+#### 8.3 — QuickBooks Online sync (worker)
+**What**: Sync journal entries, payments, and invoices to QuickBooks via `qbo_*` references.
+
+**Design**:
+- OAuth connection stored in `integrations` (provider `quickbooks`, `qbo_realm_id`). A `qbo-sync` job pushes new journal entries/payments and writes back `qbo_journal_id`/`qbo_payment_id`. Idempotent on local id.
+
+**Testing**:
+- `Integration (mocked QBO): post journal entry → qbo_journal_id written back`
+- `Integration: re-run sync → no duplicate QBO entry (idempotent)`
+- `Integration: QBO auth expired → integration status=error, alert raised`
+
+---
+
+## Phase 9: Reporting & KPI Dashboards
+
+### Purpose
+Surface the operational metrics dealers run on. Implements real-time KPI dashboards (gross profit, car count, days-to-turn, F&I penetration, service absorption) and a dealership home dashboard. After this phase managers get the at-a-glance view that is table-stakes for any DMS.
+
+### Tasks
+
+#### 9.1 — KPI query layer
+**What**: Read-optimised KPI endpoints backed by SQL aggregates over the normalized tables.
+
+**Design**:
+- `GET /reporting/sales?period=` → deals closed, total/avg front+back gross, gross by salesperson, avg days-to-turn.
+- `GET /reporting/fi-penetration?period=` → product attach rate and margin by `product_type` (joins deals → deal_fi_products → fi_products).
+- `GET /reporting/service?period=` → car count, avg RO, hours billed vs available, service absorption %.
+- `GET /reporting/inventory` → new/used counts, avg days in stock, units over 60 days.
+- Materialised views refreshed on a schedule for heavy aggregates; live queries for current-day.
+
+**Testing**:
+- `Integration (seeded data): sales report computes correct total gross and per-salesperson ranking`
+- `Integration: F&I penetration = deals-with-product / total funded deals`
+- `Integration: days-to-turn from acquisition to sold matches fixture`
+- `Integration: service absorption % computed from service+parts gross over fixed overhead`
+
+#### 9.2 — Dealership home dashboard & alerts
+**What**: A single dashboard endpoint aggregating active deals, inventory aging, open ROs, leads awaiting response, and compliance alerts.
+
+**Design**:
+- `GET /reporting/dashboard` returns the `rm_dealership_dashboard`-shaped payload (active deals, deals in F&I, vehicles over 60 days, open ROs, leads awaiting response with avg response time, compliance alerts array, AI insights array).
+- Compliance alerts pull OFAC potential-matches and 8300 deadlines; AI insights pull repricing/churn suggestions (Phase 10).
+
+**Testing**:
+- `Integration: dashboard reflects 3 active deals, 1 in F&I from seed`
+- `Integration: vehicle aged 65 days appears in vehicles_over_60_days`
+- `Integration: unfiled 8300 within 5 days appears in compliance_alerts`
+
+---
+
+## Phase 10: AI-Native Differentiators
+
+### Purpose
+The features `research.md` identifies as the AI-native advantage: intelligent used-vehicle pricing/acquisition, churn prediction, and an MCP agent surface. These deepen the value beyond table-stakes and are where the project beats bolted-on-AI incumbents. Requires the data accumulated by earlier phases.
+
+### Tasks
+
+#### 10.1 — AI inventory pricing & repricing
+**What**: Recommend market-based prices and flag aged inventory for repricing.
+
+**Design**:
+- `POST /inventory/vehicles/:id/price-recommend` builds a prompt (`packages/ai/src/pricing.ts`) from vehicle attributes, acquisition cost, days-in-stock, and (where available) competitor/market inputs; structured output:
+```ts
+const PricingRec = z.object({
+  recommended_cents: z.number().int(),
+  market_avg_cents: z.number().int(),
+  competitor_low_cents: z.number().int(),
+  competitor_high_cents: z.number().int(),
+  days_to_turn_estimate: z.number().int(),
+  confidence: z.number().min(0).max(1),
+});
+```
+- Result written to `vehicles.ai_market_price_cents` and `ai_pricing_json`.
+- A daily `reprice-aged` job recommends reductions for in-stock vehicles over a configurable age, surfaced as dashboard AI insights.
+
+**Testing**:
+- `Integration (mocked LLM): price recommend → ai_pricing_json populated with confidence`
+- `Integration: vehicle over 45 days → reprice insight generated`
+- `Unit: pricing prompt includes days_in_stock and acquisition_cost`
+
+#### 10.2 — Customer churn prediction
+**What**: Score customers for churn risk from RFM + service history.
+
+**Design**:
+- A scheduled `churn-score` job computes recency/frequency/monetary features per customer and calls the LLM (or a deterministic scoring fallback) to set `customers.ai_churn_risk` (0–1) and recommended retention action. High-risk customers appear in dashboard AI insights.
+
+**Testing**:
+- `Integration: customer with no visit in 18 months → ai_churn_risk elevated`
+- `Integration: high-risk customers surface in dashboard insights`
+
+#### 10.3 — MCP server (agentic surface)
+**What**: Expose DMS data and actions to LLM agents via the Model Context Protocol.
+
+**Design**:
+- `apps/mcp` server (per `standards.md` §MCP) exposing: resources (read-only inventory, customer history, parts catalogue) and tools (create lead, schedule appointment, recommend price, screen OFAC) with Zod-defined input/output schemas. Auth via scoped client-credentials JWT; all tool invocations audited with `actor_type='ai'`.
+- Prompt templates as MCP prompts: write-up, trade-in appraisal, service advisor upsell.
+
+**Testing**:
+- `Integration: MCP list-resources returns inventory and customer resources`
+- `Integration: MCP create-lead tool with valid token → lead created, audited as ai actor`
+- `Integration: MCP tool without scope → rejected`
+
+---
+
+## Phase 11: STAR Interoperability & Partner API
+
+### Purpose
+Structural interoperability advantage: implement STAR Domain Model 2026 schemas and a partner OAuth surface so OEM/lender/vendor integrations work natively. After this phase the DMS exposes/accepts STAR-aligned payloads and publishes an OpenAPI 3.1 spec.
+
+### Tasks
+
+#### 11.1 — STAR schema mapping & Deal/Service APIs
+**What**: Map internal deals, ROs, and appointments to STAR JSON schemas (Draft 2020-12) and expose STAR-shaped partner endpoints.
+
+**Design**:
+- `packages/contracts/src/star/` holds STAR-aligned JSON Schemas; mappers convert internal entities ↔ STAR Deal API, Service Scheduling API, and Retail Delivery Report (RDR) shapes.
+- Partner endpoints under `/partner/v1/...` accept client-credentials JWTs with `partner:read`/`partner:write` scopes, validate inbound payloads against STAR schemas, and emit STAR-shaped responses. RDR submission stamps `deals.rdr_submitted_at`.
+
+**Testing**:
+- `Integration: internal deal → STAR Deal payload validates against STAR JSON Schema`
+- `Integration: inbound STAR appointment → creates internal appointment`
+- `Integration: RDR submit → rdr_submitted_at set, STAR response returned`
+- `Integration: partner token lacking partner:write → 403 on writes`
+
+#### 11.2 — OpenAPI 3.1 spec publication
+**What**: Publish the auto-generated OpenAPI 3.1.1 document.
+
+**Design**:
+- NestJS Swagger module emits `/openapi.json` (3.1.1) covering all public + partner endpoints; served and committed to the repo for partner consumption.
+
+**Testing**:
+- `Integration: GET /openapi.json → valid OpenAPI 3.1.1 (schema-validated)`
+- `Integration: every partner endpoint appears in the spec`
+
+---
+
+## Phase 12: Web Console, Packaging & Self-Host Deployment
+
+### Purpose
+Deliver the user-facing dealership console and make the system deployable. After this phase a dealer can run the full stack via docker-compose and operate sales, F&I, service, parts, accounting, and dashboards through a browser.
+
+### Tasks
+
+#### 12.1 — Next.js dealership console
+**What**: Role-aware web UI covering the MVP workflows.
+
+**Design**:
+- Pages: dashboard, inventory list/detail, customers, leads (Kanban by status), deal desking (with live desking math + F&I menu + lender panel + compliance gate indicators), service lane (RO board), parts, accounting/journal, reports.
+- Server components fetch via the API using the session JWT; role gates hide unauthorised actions (mirrors API RBAC). shadcn/ui components; money rendered via `toDisplay`.
+
+**Testing**:
+- `E2E (Playwright): login + MFA → dashboard loads`
+- `E2E: create vehicle by VIN → appears in inventory with decoded make/model`
+- `E2E: build a deal end-to-end (desk, add F&I, screen OFAC, sign, fund) → status funded, gross shown`
+- `E2E: salesperson cannot see accounting nav`
+
+#### 12.2 — Packaging & self-host deployment
+**What**: Production Docker images, compose for self-host, and operational docs.
+
+**Design**:
+- Multi-stage `Dockerfile.api`/`.worker`/`.web`; production `docker-compose.prod.yml` with Postgres, Redis, MinIO/S3, api, worker, web, plus a `migrate` one-shot and a `seed` profile.
+- Health/readiness endpoints; structured logging; env-var-driven config with secrets via env file.
+- Backup guidance (pg_dump) and audit-log retention (10-year partitions) documented.
+
+**Testing**:
+- `Integration: docker compose -f docker-compose.prod.yml up → all services healthy, migrate runs once`
+- `Integration: /health and /ready return 200 under load`
+- `E2E (clean volume): fresh deploy → seed dealership reachable, full deal flow works`
+
+---
+
+## Phase Summary & Dependencies
+
+```
+Phase 1: Foundation (monorepo, DB, auth, RBAC, MFA, audit)   ── required by everything
+    │
+    ├── Phase 2: Inventory & Vehicle Data        ── requires 1
+    │       │
+    ├── Phase 3: Customers, Leads & CRM          ── requires 1 (can parallel Phase 2)
+    │       │
+    └───────┴── Phase 4: Deals & Desking         ── requires 2 + 3   ◄ core value
+                    │
+                    ├── Phase 5: F&I & Lenders            ── requires 4
+                    │       │
+                    ├── Phase 6: Compliance               ── requires 4 (and 5 for lender gate)
+                    │
+            Phase 7: Service & Parts              ── requires 2 + 3 (can parallel 4/5/6)
+                    │
+            Phase 8: Accounting & Payments        ── requires 4 + 7
+                    │
+            Phase 9: Reporting & Dashboards       ── requires 4,5,6,7,8
+                    │
+            Phase 10: AI Differentiators          ── requires 2,3,4,5 (richer with 7,9)
+                    │
+            Phase 11: STAR Interop & Partner API  ── requires 4 + 7
+                    │
+            Phase 12: Web Console & Deployment    ── requires all functional phases
+```
+
+**Parallelism opportunities:**
+- Phases **2 and 3** can be built concurrently after Phase 1.
+- Phase **7 (Service & Parts)** can be built concurrently with Phases **4–6** (it depends only on inventory + customers).
+- Phases **10 (AI)** and **11 (STAR)** can be built concurrently once their data dependencies (4–9) exist.
+
+---
+
+## Definition of Done (per phase)
+
+Every phase must satisfy all of the following before it is considered complete:
+
+1. All tasks in the phase implemented.
+2. All unit and integration tests for the phase pass (`pnpm test`).
+3. Real-dependency integration tests (Postgres/Redis/MinIO via Testcontainers) pass in CI.
+4. Linting passes (`pnpm lint`) and formatting is clean (Prettier).
+5. Type checking passes (`pnpm typecheck` / `tsc --noEmit`) with no errors.
+6. All Docker images build and `docker compose up` brings the stack to healthy.
+7. The phase's primary workflow works end-to-end (verified by an integration or Playwright E2E test).
+8. New config / environment variables are added to `.env.example` and documented.
+9. New API endpoints appear in the auto-generated OpenAPI 3.1.1 spec.
+10. Database changes are expressed as Drizzle migrations (no manual schema drift); `audit_log` partitions covered.
+11. Every mutating endpoint writes an `audit_log` entry with `mfa_verified` (FTC Safeguards Rule).
+12. No customer NPI is logged in plaintext application logs; secrets only via env.
+```
